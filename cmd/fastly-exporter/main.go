@@ -29,27 +29,29 @@ var programVersion = "dev"
 
 func main() {
 	var (
-		token               string
-		listen              string
-		namespace           string
-		deprecatedSubsystem string
-		serviceShard        string
-		serviceIDs          stringslice
-		serviceAllowlist    stringslice
-		serviceBlocklist    stringslice
-		metricAllowlist     stringslice
-		metricBlocklist     stringslice
-		certificateRefresh  time.Duration
-		datacenterRefresh   time.Duration
-		productRefresh      time.Duration
-		serviceRefresh      time.Duration
-		dictionaryRefresh   time.Duration
-		apiTimeout          time.Duration
-		rtTimeout           time.Duration
-		aggregateOnly       bool
-		debug               bool
-		versionFlag         bool
-		configFileExample   bool
+		token                string
+		listen               string
+		namespace            string
+		deprecatedSubsystem  string
+		serviceShard         string
+		serviceIDs           stringslice
+		serviceAllowlist     stringslice
+		serviceBlocklist     stringslice
+		metricAllowlist      stringslice
+		metricBlocklist      stringslice
+		backendHealthURLs    stringslice
+		certificateRefresh   time.Duration
+		datacenterRefresh    time.Duration
+		productRefresh       time.Duration
+		serviceRefresh       time.Duration
+		dictionaryRefresh    time.Duration
+		apiTimeout           time.Duration
+		rtTimeout            time.Duration
+		backendHealthRefresh time.Duration
+		aggregateOnly        bool
+		debug                bool
+		versionFlag          bool
+		configFileExample    bool
 	)
 
 	fs := flag.NewFlagSet("fastly-exporter", flag.ContinueOnError)
@@ -64,15 +66,17 @@ func main() {
 		fs.Var(&serviceBlocklist, "service-blocklist", "if set, don't include services whose names match this regex (repeatable)")
 		fs.Var(&metricAllowlist, "metric-allowlist", "if set, only export metrics whose names match this regex (repeatable)")
 		fs.Var(&metricBlocklist, "metric-blocklist", "if set, don't export metrics whose names match this regex (repeatable)")
+		fs.Var(&backendHealthURLs, "backend-health-url", "backend health endpoint mapping 'service_id=https://...'(repeatable)")
 		fs.DurationVar(&certificateRefresh, "certificate-refresh", 6*time.Hour, "how often to poll api.fastly.com for updated custom TLS certificate metadata (10m–24h); a value of 0 will disable certificate refresh")
 		fs.DurationVar(&datacenterRefresh, "datacenter-refresh", 10*time.Minute, "how often to poll api.fastly.com for updated datacenter metadata (10m–1h)")
 		fs.DurationVar(&productRefresh, "product-refresh", 10*time.Minute, "how often to poll api.fastly.com for updated product metadata (10m–24h)")
 		fs.DurationVar(&serviceRefresh, "service-refresh", 1*time.Minute, "how often to poll api.fastly.com for updated service metadata (15s–10m)")
 		fs.DurationVar(&dictionaryRefresh, "dictionary-refresh", 5*time.Minute, "how often to poll api.fastly.com for dictionary metadata (1m–24h)")
-
+		fs.DurationVar(&backendHealthRefresh, "backend-health-refresh", 1*time.Minute, "how often to poll backend health endpoints (15s–10m); requires -backend-health-url")
 		fs.DurationVar(&serviceRefresh, "api-refresh", 1*time.Minute, "DEPRECATED -- use service-refresh instead")
 		fs.DurationVar(&apiTimeout, "api-timeout", 15*time.Second, "HTTP client timeout for api.fastly.com requests (5–60s)")
 		fs.DurationVar(&rtTimeout, "rt-timeout", 45*time.Second, "HTTP client timeout for rt.fastly.com requests (45–120s)")
+
 		fs.BoolVar(&aggregateOnly, "aggregate-only", false, "Use aggregated data rather than per-datacenter")
 		fs.BoolVar(&debug, "debug", false, "log debug information")
 		fs.BoolVar(&versionFlag, "version", false, "print version information and exit")
@@ -103,6 +107,25 @@ func main() {
 	{
 		logger = log.NewLogfmtLogger(os.Stderr)
 		logger = level.NewFilter(logger, getLogLevel(debug))
+	}
+
+	var backendHealthEndpoints map[string]string
+	{
+		backendHealthEndpoints = map[string]string{}
+		for _, v := range backendHealthURLs {
+			toks := strings.SplitN(v, "=", 2)
+			if len(toks) != 2 {
+				level.Error(logger).Log("err", "-backend-health-url must be 'service_id=https://...'", "value", v)
+				os.Exit(1)
+			}
+			serviceID := strings.TrimSpace(toks[0])
+			url := strings.TrimSpace(toks[1])
+			if serviceID == "" || url == "" {
+				level.Error(logger).Log("err", "-backend-health-url must be 'service_id=https://...'", "value", v)
+				os.Exit(1)
+			}
+			backendHealthEndpoints[serviceID] = url
+		}
 	}
 
 	if token == "" {
@@ -185,6 +208,16 @@ func main() {
 			level.Warn(logger).Log("msg", "-rt-timeout cannot be longer than 120s; setting it to 120s")
 			rtTimeout = 120 * time.Second
 		}
+
+		if backendHealthRefresh < 15*time.Second {
+			level.Warn(logger).Log("msg", "-backend-health-refresh cannot be shorter than 15s; setting it to 15s")
+			backendHealthRefresh = 15 * time.Second
+		}
+		if backendHealthRefresh > 10*time.Minute {
+			level.Warn(logger).Log("msg", "-backend-health-refresh cannot be longer than 10m; setting it to 10m")
+			backendHealthRefresh = 10 * time.Minute
+		}
+
 	}
 
 	var serviceNameFilter filter.Filter
@@ -412,6 +445,26 @@ func main() {
 		defaultGatherers = append(defaultGatherers, bg)
 	}
 
+	var backendMetrics *prom.BackendMetrics
+	{
+		backendMetrics = prom.NewBackendMetrics(namespace, deprecatedSubsystem)
+		defaultGatherers = append(defaultGatherers, backendMetrics.Gatherer())
+	}
+
+	backendMetrics.Handshake.WithLabelValues("unknown", "unknown", "aggregate").Set(0)
+	backendMetrics.Health.WithLabelValues("unknown", "unknown", "aggregate").Set(0)
+
+	var backendHealthCache *api.BackendHealthCache
+	{
+		enabled := len(backendHealthEndpoints) > 0 && !metricNameFilter.Blocked(prometheus.BuildFQName(namespace, deprecatedSubsystem, "backend_health_status"))
+		backendHealthCache = api.NewBackendHealthCache(apiClient, serviceCache, backendHealthEndpoints, backendMetrics.Health, apiLogger, enabled)
+		if backendHealthCache.Enabled() {
+			if err := backendHealthCache.Refresh(context.Background()); err != nil {
+				level.Warn(apiLogger).Log("during", "initial fetch of backend health", "err", err, "msg", "backend health metrics may be unavailable, will retry")
+			}
+		}
+	}
+
 	var registry *prom.Registry
 	{
 		registry = prom.NewRegistry(programVersion, namespace, deprecatedSubsystem, metricNameFilter, defaultGatherers)
@@ -494,6 +547,27 @@ func main() {
 				case <-ticker.C:
 					if err := dictionaryCache.Refresh(ctx); err != nil {
 						level.Warn(apiLogger).Log("during", "dictionary info refresh", "err", err, "msg", "dictionary info metrics may be stale")
+					}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}, func(error) {
+			ticker.Stop()
+			cancel()
+		})
+	}
+	if backendHealthCache.Enabled() {
+		var (
+			ctx, cancel = context.WithCancel(context.Background())
+			ticker      = time.NewTicker(backendHealthRefresh)
+		)
+		g.Add(func() error {
+			for {
+				select {
+				case <-ticker.C:
+					if err := backendHealthCache.Refresh(ctx); err != nil {
+						level.Warn(apiLogger).Log("during", "backend health refresh", "err", err, "msg", "backend health metrics may be stale")
 					}
 				case <-ctx.Done():
 					return ctx.Err()
